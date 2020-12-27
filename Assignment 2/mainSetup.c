@@ -1,16 +1,32 @@
+#include <sys/wait.h>
+#include <sys/types.h> 
 #include <stdio.h>
 #include <unistd.h>
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
+#include <stdbool.h>
+#include <sys/stat.h>
+#include <sys/resource.h>
+#include <fcntl.h>
  
 #define MAX_LINE 80 /* 80 chars per line, per command, should be enough. */
+
+//flags:
+#define CREATE_FLAGS1 (O_WRONLY|O_CREAT|O_TRUNC)
+#define CREATE_FLAGS2 (O_WRONLY|O_CREAT|O_APPEND)
+#define CREATE_MODE (S_IRUSR|S_IWUSR|S_IRGRP|S_IROTH)
+#define readOnly_Flag O_RDONLY
+
  
 /* The setup function below will not return any value, but it will just: read
 in the next command line; separate it into distinct arguments (using blanks as
 delimiters), and set the args array entries to point to the beginning of what
 will become null-terminated, C-style strings. */
+
+bool isFg = true;
+int fg;
 
 void setup(char inputBuffer[], char *args[], int *background) {
     int length, /* # of characters in the command line */
@@ -71,8 +87,9 @@ void setup(char inputBuffer[], char *args[], int *background) {
 		            start = i;
                 if (inputBuffer[i] == '&'){
 		            *background  = 1;
-                    inputBuffer[i-1] = '\0';
-		        }
+	                    inputBuffer[i-1] = '\0';
+		 }
+
 	    } /* end of switch */
     }    /* end of for */
     args[ct] = NULL; /* just in case the input line was > 80 */
@@ -95,7 +112,6 @@ struct backgroundProcess {
     char **commandLineArgs;
     struct backgroundProcess *nextBackgroundProcess;
 };
-
 struct bookmark {
 	int index;
 	char **commandLineArgs;
@@ -126,6 +142,26 @@ void removeLLNode(struct backgroundProcess *currentPointer) {
 	tempPointer = currentPointer->nextBackgroundProcess;
 	currentPointer = tempPointer;
 }
+void catchCTRLZ(int sigNo){
+	int exit_stat;
+	if(isFg){ //checks if there is any fg process
+		kill(fg,0); //checks if fg process is still running, if it is not then it sets errno to ESRCH
+		if(errno != ESRCH){
+			kill(fg, SIGKILL); //because there is a fg process still running it send a kill signal
+			waitpid(-fg, &exit_stat, WNOHANG);//checks if any zombie children exits 
+			isFg=false;
+		}else{
+			fprintf(stderr, "There is no foreground process which is still running");
+			isFg=false;
+			printf("\nmyshell:");
+			fflush(stdout);		
+		
+		}
+	}else{
+		printf("\nmyshell:");
+		fflush(stdout);
+	}
+}
 
 int main(void) {
     char inputBuffer[MAX_LINE]; /*buffer to hold command entered */
@@ -135,6 +171,21 @@ int main(void) {
 	int backgroundProcessStatus;
     struct backgroundProcess *bgLLHead = NULL;
 	struct bookmark *bmLLHead = NULL;
+
+	struct sigaction act;
+	act.sa_handler=catchCTRLZ;
+	act.sa_flags=SA_RESTART;
+	int stat=sigemptyset(&act.sa_mask);
+	if(stat==-1){
+		perror("Error to initialize signal set");
+		exit(1);
+	}
+	stat=sigaction(SIGTSTP,&act,NULL);
+	if(stat==-1){
+		perror("Error to set signal handler for SIGTSTP");
+		exit(1);
+	}
+
     while (1) {
         background = 0;
         programExecution = 1;   // this variable will be used to differentiate between different requirements
@@ -159,11 +210,12 @@ int main(void) {
         // this if condition will turn off execution mode and perform its task (ps_all)
         if (strcmp(args[0], "ps_all") == 0) {
             programExecution = 0;
+	    pid_t childProcessId;
 
 			struct backgroundProcess *bgLLNode = bgLLHead;
 			printf("Finished:\n");
 			while (bgLLNode != NULL) {
-				pid_t childProcessId = bgLLNode->backgroundProcessId;
+				childProcessId = bgLLNode->backgroundProcessId;
 				if (waitpid(childProcessId, NULL, WNOHANG) == childProcessId) {
 					char **arguments = bgLLNode->commandLineArgs;
 					printf("   [%d]  ", bgLLNode->processJobId);
@@ -288,10 +340,151 @@ int main(void) {
 		// the following block contains the program execution
         if (programExecution) {
             pid_t childpid;
+	    int redirectionMode;
+	    char inputFile[MAX_LINE/2+1], outputFile[MAX_LINE/2+1];
+	    int fd;
+
             if ( (childpid = fork()) == -1 ) {   // this condition is to check if fork was successfull
                 fprintf(stderr, "failed to fork!");
                 continue;
             } else if (childpid == 0) {   // this condition is true when the processor schedules the child process
+		for(int i=0;args[i]!=NULL;i++){
+			if(strcmp(args[i],">")==0){ //checks if redirection is in create/truncate mode
+
+				if(*(args+i+1)==NULL){ //if there is no output file gives necessary warnings
+					fprintf(stderr, "A file should have been provided\n");
+					exit(1);	
+				}else{
+					args[i]=NULL;
+					redirectionMode=1; //sets 1 if its in create/truncate mode
+					strcpy(outputFile,*(args+i+1));	
+					break;	
+				}	
+					
+			}else if(strcmp(args[i],">>")==0){//checks if redirection is in create append mode
+				if(*(args+i+1)==NULL){
+					fprintf(stderr, "A file should have been provided\n");
+					exit(1);
+				}else{
+					args[i]=NULL;
+					redirectionMode=2; //sets 2 if its in create/append mode
+					strcpy(outputFile,*(args+i+1));
+					break;
+				}			
+			}else if(strcmp(args[i],"<")==0){//checks if redirection is in input mode
+				if(*(args+i+1)==NULL){
+					fprintf(stderr,"A file should have been provided\n");
+					exit(1);
+				}else{
+					args[i]=NULL;
+					redirectionMode=3; //sets 3 if its in input mode
+					strcpy(inputFile,*(args+i+1));
+					if(*(args+i+2)!=NULL && strcmp(args[i+2], ">")){//there is an output redirection so it is been handling here
+						if(*(args+i+3)==NULL){
+							fprintf(stderr, "A file should have been provided\n");
+							exit(1);
+						}else{
+							redirectionMode+=1; //create/truncate + input mode=4
+							strcpy(outputFile,*(args+i+3));
+							break;
+						}
+					
+					}else if (*(args+i+2)==NULL){
+						break; //because there is no output redirection					
+					}
+				}
+				
+			}else if(strcmp(args[i],"2>")==0){
+				if(*(args+i+1)==NULL){
+					fprintf(stderr,"A file should have been provided\n");
+					exit(1);
+				}else{
+					args[i]=NULL;
+					redirectionMode=5; //sets 5(cuz there is 4) if its in input mode
+					strcpy(outputFile, *(args+i+1));
+					break;
+				}
+			}	
+		}
+		switch(redirectionMode){
+			case 1:	
+				fd=open(outputFile,CREATE_FLAGS1,CREATE_MODE);
+				if(fd==-1){
+					perror("Failed to open the file");
+					exit(1);
+				}if(dup2(fd,STDOUT_FILENO)==-1){
+					perror("Failed to redirect standard output");
+					exit(1);
+					if(close(fd)==-1){
+						perror("Failed to close the file");
+						exit(1);
+					}
+				}
+				break;
+							
+			case 2:
+				fd=open(outputFile,CREATE_FLAGS2,CREATE_MODE);
+				if(fd==-1){
+					perror("Failed to open the file");
+					exit(1);
+				}if(dup2(fd,STDOUT_FILENO)==-1){
+					perror("Failed to redirect standard output");
+					exit(1);
+					if(close(fd)==-1){
+						perror("Failed to close the file");
+						exit(1);
+					}
+				}
+				break;
+	
+	
+			case 3:
+				fd=open(inputFile, readOnly_Flag);
+				if(fd==-1){
+					perror("Failed to open the file");
+					exit(1);
+				}if(dup2(fd,STDIN_FILENO)==-1){
+					perror("Failed to redirect standard input");
+					exit(1);
+					if(close(fd)==-1){
+						perror("Failed to close the file");
+						exit(1);
+					}
+				}
+				break;
+
+	
+			case 4:
+				fd=open(outputFile, CREATE_FLAGS1,CREATE_MODE);
+				if(fd==-1){
+					perror("Failed to open the file");
+					exit(1);
+				}if(dup2(fd,STDOUT_FILENO)==-1){
+					perror("Failed to redirect standard input");
+					exit(1);
+					if(close(fd)==-1){
+						perror("Failed to close the file");
+						exit(1);
+					}
+				}
+				break;
+
+			case 5:	
+				fd=open(outputFile,CREATE_FLAGS1,CREATE_MODE);
+				if(fd==-1){
+					perror("Failed to open the file");
+					exit(1);
+				}if(dup2(fd,STDERR_FILENO)==-1){
+					perror("Failed to redirect standard output");
+					exit(1);
+					if(close(fd)==-1){
+						perror("Failed to close the file");
+						exit(1);
+					}
+				}
+				break;
+		}
+
 
                 char *path = getenv("PATH");   // this returns all of the dirs in PATH env variable
                 if (path == NULL) {   // this condition is to check if PATH is empty
@@ -319,7 +512,10 @@ int main(void) {
 
             } else {   // this condition is true when the processor schedules the parent process
                 if (background == 0) {
-                    waitpid(childpid, NULL, 0);
+			fg=childpid;
+			isFg=true;
+                   	waitpid(childpid, NULL, 0);
+			isFg = false;
                 } else {
                     struct backgroundProcess *bgLLNode = NULL;
 
@@ -355,7 +551,6 @@ int main(void) {
                     }
                 }
             }
-        }
-		// </execution>
+        }		// </execution>
     }
 }
